@@ -123,64 +123,68 @@ def _as_validation_error(env, exc):
     # Generic error fallback
     return ValidationError(env._("The operation cannot be completed: %s", exc.args[0]))
 
+
+
 def retrying(func, env):
     """
-    Call ``func`` until the function returns without serialisation
-    error. A serialisation error occurs when two requests in independent
-    cursors perform incompatible changes (such as writing different
-    values on a same record). By default, it retries up to 5 times.
-
-    :param callable func: The function to call, you can pass arguments
-        using :func:`functools.partial`:.
+    Retry calling the function on serialization failures. It retries up
+    to a maximum of 5 times with exponential backoff.
+    
+    :param callable func: The function to call.
     :param odoo.api.Environment env: The environment where the registry
         and the cursor are taken.
     """
-    try:
-        for tryno in range(1, MAX_TRIES_ON_CONCURRENCY_FAILURE + 1):
-            tryleft = MAX_TRIES_ON_CONCURRENCY_FAILURE - tryno
-            try:
-                result = func()
-                if not env.cr._closed:
-                    env.cr.flush()  # submit the changes to the database
-                break
-            except (IntegrityError, OperationalError) as exc:
-                if env.cr._closed:
-                    raise
-                env.cr.rollback()
-                env.reset()
-                env.registry.reset_changes()
-                if request:
-                    request.session = request._get_session_and_dbname()[0]
-                    # Rewind files in case of failure
-                    for filename, file in request.httprequest.files.items():
-                        if hasattr(file, "seekable") and file.seekable():
-                            file.seek(0)
-                        else:
-                            raise RuntimeError(f"Cannot retry request on input file {filename!r} after serialization failure") from exc
-                if isinstance(exc, IntegrityError):
-                    raise _as_validation_error(env, exc) from exc
-                if not isinstance(exc, PG_CONCURRENCY_EXCEPTIONS_TO_RETRY):
-                    raise
-                if not tryleft:
-                    _logger.info("%s, maximum number of tries reached!", errorcodes.lookup(exc.pgcode))
-                    raise
+    MAX_RETRIES = MAX_TRIES_ON_CONCURRENCY_FAILURE
 
-                wait_time = random.uniform(0.0, 2 ** tryno)
-                _logger.info("%s, %s tries left, try again in %.04f sec...", errorcodes.lookup(exc.pgcode), tryleft, wait_time)
-                time.sleep(wait_time)
-        else:
-            # handled in the "if not tryleft" case
-            raise RuntimeError("unreachable")
+    for attempt in range(1, MAX_RETRIES + 1):
+        remaining_tries = MAX_RETRIES - attempt
+        try:
+            result = func()
+            
+            if not env.cr._closed:
+                env.cr.flush()  # flush changes to the database
+                env.cr.commit()  # commit the transaction
+            env.registry.signal_changes()  # signal any registry changes
+            return result  # exit after success
 
-    except Exception:
-        env.reset()
-        env.registry.reset_changes()
-        raise
+        except (IntegrityError, OperationalError) as exc:
+            if env.cr._closed:
+                raise
 
-    if not env.cr.closed:
-        env.cr.commit()  # effectively commits and execute post-commits
-    env.registry.signal_changes()
-    return result
+            env.cr.rollback()  # rollback transaction on failure
+            env.reset()
+            env.registry.reset_changes()
+
+            # Handle request rewinding for file uploads (if applicable)
+            if request:
+                request.session = request._get_session_and_dbname()[0]
+                for filename, file in request.httprequest.files.items():
+                    if hasattr(file, "seekable") and file.seekable():
+                        file.seek(0)
+                    else:
+                        raise RuntimeError(f"Cannot retry request on input file {filename!r}") from exc
+
+            # IntegrityError should not be retried
+            if isinstance(exc, IntegrityError):
+                raise _as_validation_error(env, exc) from exc
+
+            # Check if exception is retryable
+            if not isinstance(exc, PG_CONCURRENCY_EXCEPTIONS_TO_RETRY):
+                raise
+
+            if remaining_tries == 0:
+                _logger.info("%s, maximum retry limit reached!", errorcodes.lookup(exc.pgcode))
+                raise
+
+            # Exponential backoff with jitter
+            wait_time = random.uniform(0.5, 2 ** attempt)
+            _logger.info("%s, %s retries left, retrying in %.04f seconds...", errorcodes.lookup(exc.pgcode), remaining_tries, wait_time)
+            time.sleep(wait_time)
+
+    # If all retries are exhausted, raise an exception
+    raise RuntimeError("Exceeded maximum retry attempts")
+
+
 
 
 def _traverse_containers(val, type_):
