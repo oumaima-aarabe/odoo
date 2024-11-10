@@ -72,24 +72,27 @@ def execute(db, uid, obj, method, *args, **kw):
 
 
 def _as_validation_error(env, exc):
-    """ Return the IntegrityError encapsuled in a nice ValidationError """
+    """ Return the IntegrityError encapsulated in a nicely formatted ValidationError. """
 
     unknown = env._('Unknown')
     model = DotDict({'_name': 'unknown', '_description': unknown})
     field = DotDict({'name': 'unknown', 'string': unknown})
+
+    # Find the model and field based on the exception details
     for _name, rclass in env.registry.items():
         if exc.diag.table_name == rclass._table:
             model = rclass
-            field = model._fields.get(exc.diag.column_name) or field
-            break
+            field = model._fields.get(exc.diag.column_name, field)
+            break  # Exit loop once model and field are found
 
+    # Match specific database errors
     match exc:
         case errors.NotNullViolation():
             return ValidationError(env._(
                 "The operation cannot be completed:\n"
                 "- Create/update: a mandatory field is not set.\n"
-                "- Delete: another model requires the record being deleted."
-                " If possible, archive it instead.\n\n"
+                "- Delete: another model requires the record being deleted. "
+                "If possible, archive it instead.\n\n"
                 "Model: %(model_name)s (%(model_tech_name)s)\n"
                 "Field: %(field_name)s (%(field_tech_name)s)\n",
                 model_name=model._description,
@@ -109,14 +112,16 @@ def _as_validation_error(env, exc):
                 constraint=exc.diag.constraint_name,
             ))
 
-    if exc.diag.constraint_name in env.registry._sql_constraints:
+    # Handle SQL constraint violation
+    constraint_name = exc.diag.constraint_name
+    if constraint_name in env.registry._sql_constraints:
+        translated_constraint = translate_sql_constraint(env.cr, constraint_name, env.context.get('lang', 'en_US'))
         return ValidationError(env._(
-            "The operation cannot be completed: %s",
-            translate_sql_constraint(env.cr, exc.diag.constraint_name, env.context.get('lang', 'en_US'))
+            "The operation cannot be completed: %s", translated_constraint
         ))
 
+    # Generic error fallback
     return ValidationError(env._("The operation cannot be completed: %s", exc.args[0]))
-
 
 def retrying(func, env):
     """
